@@ -1,11 +1,11 @@
 ---
 title: 'Project: '
-author: "Hossam Osama Ahmed - 21010451"
+author: "Hossam Osama Ahmed - 21010451 , Ali Hassan Ali - 21010837"
 date: "`r Sys.Date()`"
 output:
-  pdf_document: default
-  html_document: default
   word_document: default
+  html_document: default
+  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -13,14 +13,6 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 ## Project Setup
-```{r}
-# Install required packages if not already installed
-if (!require("BiocManager", quietly = TRUE))
-    install.packages("BiocManager")
-
-BiocManager::install(c("SNPRelate", "GENESIS", "GWASTools", "qqman", "GeneNet", "gplots"))
-install.packages(c("readxl", "writexl", "ggplot2", "dplyr", "tidyr"))
-```
 
 ```{r}
 
@@ -43,15 +35,13 @@ library(tidyr)
 
 ## Task 1: Compute Kinship using SNPRelate and GENESIS
 
-### 1a. Compute kinship matrix
-
 ```{r}
 
 # Convert PLINK files to GDS format
 snpgdsPED2GDS("Qatari156_filtered_pruned.ped", 
                "Qatari156_filtered_pruned.map", 
                "Qatari156_filtered_pruned.gds", 
-               family=TRUE)
+              family=TRUE)
 
 # Open the GDS file
 genofile <- snpgdsOpen("Qatari156_filtered_pruned.gds")
@@ -67,8 +57,9 @@ kinship <- ibd$kinship
 rownames(kinship) <- ibd$sample.id
 colnames(kinship) <- ibd$sample.id
 
-# Save kinship matrix
-saveRDS(kinship, "kinship_matrix.rds")
+```
+```{r}
+saveRDS(ibd, file = "ibd.rds")
 ```
 
 ### 1b. Report individuals with kinship > 0.1
@@ -83,561 +74,426 @@ num_high_kinship <- length(high_kinship_ind)
 cat("Number of individuals with kinship > 0.1:", num_high_kinship, "\n")
 ```
 
+```{r}
+# Open GDS file
+
+genofile <- snpgdsOpen("Qatari156_filtered_pruned.gds")
+
+# Compute IBD-based kinship using MLE
+ibd_mle <- snpgdsIBDMLE(genofile, kinship = TRUE, num.thread = 12)
+
+# Extract kinship matrix
+kinship_mat <- snpgdsIBDSelection(ibd_mle)
+
+# Convert to matrix
+kinship_df <- kinship_mat$kinship 
+rownames(kinship_df) <- colnames(kinship_df) <- kinship_mat$sample.id
+
+
+```
+```{r}
+
+high_kin <- kinship_mat[kinship_mat$kinship > 0.1, ]
+unique_individuals <- unique(c(high_kin$ID1, high_kin$ID2))
+length(unique_individuals)
+snpgdsClose(genofile)
+```
 ## Task 2: Compute mQTLs with Mixed Models
+```{r}
+# -----------------------------
+# Step 1: Load PLINK PCA Results
+# -----------------------------
+eigenvectors <- read.table("Qatari156_PCA.eigenvec", header = FALSE)
+colnames(eigenvectors) <- c("FID", "IID", paste0("PC", 1:(ncol(eigenvectors)-2)))
+eigenvalues <- read.table("Qatari156_PCA.eigenval", header = FALSE)
+
+# -----------------------------
+# Step 2: Load Metabolite Data
+# -----------------------------
+metabolite_data <- read.csv("qatari_metabolites_2025.csv")
+rownames(metabolite_data) <- metabolite_data$Sample
+pcs <- eigenvectors[, 2:5]
+metabolite_data <- merge(metabolite_data, pcs, by.x = "Sample", by.y = "IID")
+metabolite_data$scanID <- metabolite_data$Sample
+scanAnnot <- ScanAnnotationDataFrame(metabolite_data)
+
+```
+
+```{r}
+
+sample_ids <- metabolite_data$scanID
+kinship_matrix <- matrix(0, nrow = length(sample_ids), ncol = length(sample_ids),
+                         dimnames = list(sample_ids, sample_ids))
+metabolite_names <- colnames(metabolite_data)[2:22]
+
+for (i in 1:nrow(kinship_mat)) {
+  id1 <- kinship_mat$ID1[i]
+  id2 <- kinship_mat$ID2[i]
+  kinship_matrix[id1, id2] <- kinship_mat$kinship[i]
+  kinship_matrix[id2, id1] <- kinship_mat$kinship[i]
+}
+
+diag(kinship_matrix) <- 0.5
+
+```
+
+```{r}
+corrected_matrix <- data.frame(scanID =rownames(metabolite_data["scanID"]))
+corrected_matrix$scanID <- metabolite_data$Sample
+```
 
 ### 2a-c. mQTL analysis with mixed models
 ```{r}
-# Load required libraries
+# -----------------------------
+# Load Required Libraries
+# -----------------------------
 library(GENESIS)
-library(gdsfmt)
-library(SNPRelate)
-library(openxlsx)
 library(dplyr)
+library(ggplot2)
+genoReader <- GdsGenotypeReader("Qatari156_filtered_pruned.gds")
+# Create GenotypeData object
+genoData <- GenotypeData(genoReader)
+genoIter <- GenotypeBlockIterator(genoData, snpBlock = 100)
+# -----------------------------
+# Step 3: Define Variables
+# -----------------------------
+heritabilities <- data.frame(Metabolite = character(), Heritability = numeric(), Lower = numeric(), Upper = numeric(), stringsAsFactors = FALSE)
+inflation_factors <- data.frame(Metabolite = character(), Lambda = numeric(), stringsAsFactors = FALSE)
+all_assoc_results <- list()       
+significant_assoc_results <- list() 
 
-# ----------------------------------------
-# 1. Set Up File Paths (MODIFY THESE)
-# ----------------------------------------
 
-metab_file <- "qatari_metabolites_2025.csv"
-output_file <- "mQTL_results.xlsx"
-
-# ----------------------------------------
-# 2. Data Preparation with Error Checking
-# ----------------------------------------
-
-snpgdsClose(gds)
-
-
-# Convert PLINK to GDS format
-gds_file <- "Qatari156_filtered_pruned.gds"
-if (!file.exists(gds_file)) {
-  snpgdsPED2GDS(ped_file, map_file, gds_file)
-}
-
-# Open GDS file with error handling
-genofile <- tryCatch({
-  snpgdsOpen(gds_file)
-}, error = function(e) {
-  stop(paste("Failed to open GDS file:", e$message))
-})
-
-# Load metabolite data
-metabolites <- read.csv(metab_file, row.names = 1)
-
-# Verify sample matching
-if (!all(rownames(metabolites) %in% read.gdsn(index.gdsn(genofile, "sample.id"))) {
-  warning("Sample IDs in metabolite data don't match genetic data!")
-}
-
-# ----------------------------------------
-# 3. Kinship and PCA Calculation
-# ----------------------------------------
-
-# Calculate kinship matrix
-ibd <- snpgdsIBDKING(genofile, num.thread = 2)
-kinship <- ibd$kinship
-rownames(kinship) <- colnames(kinship) <- ibd$sample.id
-
-# Calculate first 3 PCs
-pca <- snpgdsPCA(genofile, num.thread = 2)
-pcs <- data.frame(
-  scanID = pca$sample.id,
-  PC1 = pca$eigenvect[,1],
-  PC2 = pca$eigenvect[,2],
-  PC3 = pca$eigenvect[,3]
-)
-
-# ----------------------------------------
-# 4. mQTL Analysis with Progress Tracking
-# ----------------------------------------
-
-# Initialize storage
-all_results <- list()
-heritability_results <- list()
-processed <- 0
-errors <- 0
-
-for (metab in colnames(metabolites)) {
-  processed <- processed + 1
-  cat(sprintf("\nProcessing %d/%d: %s", processed, ncol(metabolites), metab)
+for (metabolite in metabolite_names) {
+  phenotype <- metabolite_data[[metabolite]]
   
-  # Prepare phenotype data
-  pheno <- data.frame(
-    scanID = rownames(metabolites),
-    metabolite = metabolites[,metab]
+  sample_metabolite <- data.frame(
+    scanID = metabolite_data$scanID,
+    phenotype = phenotype,
+    PC1 = metabolite_data$PC1,
+    PC2 = metabolite_data$PC2,
+    PC3 = metabolite_data$PC3,
+    row.names = sample_ids
   )
-  pheno <- merge(pheno, pcs, by = "scanID")
   
-  # Skip if too many missing values
-  if (sum(is.na(pheno$metabolite)) > 0.1 * nrow(pheno)) {
-    cat(" - Skipped (too many NAs)")
-    errors <- errors + 1
-    next
+  
+  scanAnnot <- ScanAnnotationDataFrame(sample_metabolite)
+  kin <- kinship_matrix[sample_metabolite$scanID, sample_metabolite$scanID]
+  genoIter <- GenotypeBlockIterator(genoData, snpBlock = 100)
+
+  
+  corrected_metabolite <- fitNullModel(
+    x = scanAnnot,
+    outcome = "phenotype",
+    covars = c("PC1", "PC2", "PC3"),
+    cov.mat = kin,
+    family = "gaussian"
+  )
+  
+  corrected_matrix[[metabolite]] <- corrected_metabolite$fit$resid.marginal
+  
+  # Estimate heritability
+  heritability <- varCompCI(corrected_metabolite)
+  h <- heritability[1, "Proportion"]
+  h_lower <- heritability[1, "Lower 95"]
+  h_upper <- heritability[1, "Upper 95"]
+  
+
+  heritabilities <- rbind(heritabilities, data.frame(
+    Metabolite = metabolite,
+    Heritability = h,
+    Lower = h_lower,
+    Upper = h_upper
+  ))
+  
+  # Run association test
+  assoc <- assocTestSingle(genoIter, null.model = corrected_metabolite)
+  
+  # Calculate inflation factor
+  chisq <- qchisq(1 - assoc$Score.pval, df = 1)
+  lambda <- median(chisq, na.rm = TRUE) / qchisq(0.5, df = 1)
+  inflation_factors <- rbind(inflation_factors, data.frame(Metabolite = metabolite, Lambda = lambda))
+  
+  # Add all associations
+  assoc$Metabolite <- metabolite
+  all_assoc_results[[metabolite]] <- assoc
+  
+  # Filter significant SNP-metabolite associations
+  sig_assoc <- assoc[assoc$Score.pval < 1e-4, ]
+  if (nrow(sig_assoc) > 0) {
+    sig_assoc$Metabolite <- metabolite
+    significant_assoc_results[[metabolite]] <- sig_assoc
   }
-  
-  # Fit null model
-  nullmod <- tryCatch({
-    fitNullModel(
-      pheno,
-      outcome = "metabolite",
-      covars = c("PC1", "PC2", "PC3"),
-      cov.mat = kinship,
-      verbose = FALSE
-    )
-  }, error = function(e) {
-    cat(" - Null model failed:", e$message)
-    errors <- errors + 1
-    NULL
-  })
-  
-  if (is.null(nullmod)) next
-  
-  # Run association testing
-  assoc <- tryCatch({
-    assocTestSingle(
-      genoData = genofile,
-      null.model = nullmod,
-      test = "Score",
-      verbose = FALSE
-    )
-  }, error = function(e) {
-    cat(" - Association failed:", e$message)
-    errors <- errors + 1
-    NULL
-  })
-  
-  if (is.null(assoc)) next
-  
-  # Store results
-  assoc$metabolite <- metab
-  all_results[[metab]] <- assoc
-  
-  # Calculate heritability
-  h2 <- varCompCI(nullmod, prop = TRUE)
-  heritability_results[[metab]] <- data.frame(
-    metabolite = metab,
-    h2 = h2$estimates["V_stand", "estimate"],
-    h2_lower = h2$ci["V_stand", "lower"],
-    h2_upper = h2$ci["V_stand", "upper"],
-    stringsAsFactors = FALSE
-  )
-}
 
-# ----------------------------------------
-# 5. Process and Save Results
-# ----------------------------------------
-
-# Combine all associations
-all_assoc <- bind_rows(all_results)
-
-# Filter significant hits (p < 0.0001)
-sig_assoc <- all_assoc %>% 
-  filter(pval < 0.0001) %>%
-  transmute(
-    metabolite,
-    SNP = variant.id,
-    chr = as.character(chr),
-    position = pos,
-    effect_allele = allele.index,
-    sample_size = n.obs,
-    beta = Score,
-    se = Score.SE,
-    p_value = pval
-  )
-
-# Combine heritability results
-heritability_df <- bind_rows(heritability_results)
-
-# Save to Excel
-wb <- createWorkbook()
-addWorksheet(wb, "Significant_mQTLs")
-writeData(wb, "Significant_mQTLs", sig_assoc)
-addWorksheet(wb, "Heritability")
-writeData(wb, "Heritability", heritability_df)
-saveWorkbook(wb, output_file, overwrite = TRUE)
-
-# ----------------------------------------
-# 6. Clean Up and Summary
-# ----------------------------------------
-
-# Close GDS file
-snpgdsClose(genofile)
-
-# Print summary
-cat("\n\n=== ANALYSIS COMPLETE ===\n")
-cat("Metabolites processed:", processed, "\n")
-cat("Successful analyses:", processed - errors, "\n")
-cat("Errors encountered:", errors, "\n")
-cat("Significant associations found:", nrow(sig_assoc), "\n")
-cat("Results saved to:", output_file, "\n")
-
-# Return top results if any
-if (nrow(sig_assoc) > 0) {
-  cat("\nTop significant associations:\n")
-  print(head(sig_assoc, 5))
-} else {
-  cat("\nNo significant associations at p < 0.0001 threshold\n")
 }
 
 ```
 
 
-```{r}
-# ------------------------
-# TASK 2: Fixed mQTL Analysis using y/X/cov.mat GENESIS method
-# ------------------------
 
-# 1. Load libraries
-library(SNPRelate)
-library(GENESIS)
+```{r}
+# -----------------------------
+# Step 5: Save Results
+# -----------------------------
+# Combine significant associations
 library(openxlsx)
-library(Matrix)
-library(SeqVarTools)
-library(GWASTools)
-
-
-# 2. Open genotype GDS
-gds_file <- "Qatari156_filtered_pruned.gds"
-
-gds <- snpgdsOpen(gds_file)
-
-# 3. Compute PCA
-pca <- snpgdsPCA(gds, eigen.cnt = 3, num.thread = 2)
-pcs <- data.frame(
-  sample.id = pca$sample.id,
-  PC1 = pca$eigenvect[, 1],
-  PC2 = pca$eigenvect[, 2],
-  PC3 = pca$eigenvect[, 3],
-  row.names = pca$sample.id
-)
-
-# 4. Load kinship matrix and make it positive definite
-# Replace this with your real kinship matrix loading step
-# Assuming `kinship` was already computed from Task 1:
-# You must have something like this:
-# kinship <- readRDS("kinship_matrix.rds") or however you saved it
-
-# Ensure kinship matrix is symmetric and positive definite
-kinship <- nearPD(kinship, corr = FALSE, keepDiag = TRUE)$mat
-kinship <- as.matrix(kinship)
-rownames(kinship) <- colnames(kinship)
-
-# 5. Load metabolite data
-metab <- read.csv("qatari_metabolites_2025.csv", row.names = 1)
-rownames(metab) <- gsub("\\*", "", rownames(metab))
-
-# 6. Align samples
-common_samples <- Reduce(intersect, list(
-  rownames(metab),
-  rownames(kinship),
-  rownames(pcs)
-))
-metab <- metab[common_samples, ]
-kinship <- kinship[common_samples, common_samples]
-pcs <- pcs[common_samples, ]
-
-# 7. Prepare output containers
-results_all <- list()
-heritabilities <- data.frame(
-  Metabolite = character(),
-  Heritability = numeric(),
-  CI_lower = numeric(),
-  CI_upper = numeric(),
-  stringsAsFactors = FALSE
-)
-
-# 8. Loop through each metabolite
-for (met in colnames(metab)) {
-  cat("Processing", met, "...\n")
-  
-  # Outcome
-  y <- metab[common_samples, met]
-  
-  # Covariates matrix
-  X <- model.matrix(~ PC1 + PC2 + PC3, data = pcs[common_samples, ])
-
-  # Create a data frame for the null model
-  dat <- data.frame(y = y, pcs[common_samples, ])
-
-  # Fit null model using GENESIS syntax
-  nullmod <- tryCatch({
-    GENESIS::fitNullModel(
-      dat,
-      outcome = "y",
-      covars = c("PC1", "PC2", "PC3"),
-      cov.mat = kinship,
-      family = "gaussian"
-    )
-  }, error = function(e) {
-    cat("❌ fitNullModel failed for", met, ":", e$message, "\n")
-    return(NULL)
-  })
-
-  if (!is.null(nullmod)) {
-    # Try to get heritability
-    var_comp <- tryCatch(varCompCI(nullmod), error = function(e) NULL)
-
-    if (!is.null(var_comp) && "Kinship" %in% rownames(var_comp$varComp)) {
-      h2 <- var_comp$varComp["Kinship", "estimate"]
-      
-      if ("Kinship" %in% rownames(var_comp$CI)) {
-        h2_CI <- var_comp$CI["Kinship", ]
-
-        heritabilities <- rbind(heritabilities, data.frame(
-          Metabolite = met,
-          Heritability = h2,
-          CI_lower = h2_CI["lower"],
-          CI_upper = h2_CI["upper"]
-        ))
-      } else {
-        cat("⚠️ CI for Kinship not available for", met, "\n")
-        heritabilities <- rbind(heritabilities, data.frame(
-          Metabolite = met,
-          Heritability = h2,
-          CI_lower = NA,
-          CI_upper = NA
-        ))
-      }
-    } else {
-      cat("⚠️ Kinship component missing or varCompCI failed for", met, "\n")
-      heritabilities <- rbind(heritabilities, data.frame(
-        Metabolite = met,
-        Heritability = NA,
-        CI_lower = NA,
-        CI_upper = NA
-      ))
-    }
-
-    # Association testing
-    assoc <- tryCatch({
-      assocTestSingle(
-        null.model = nullmod,
-        GdsGenotypeReader(gds_file)
-      )
-    }, error = function(e) {
-      cat("❌ assocTestSingle failed for", met, ":", e$message, "\n")
-      return(NULL)
-    })
-
-    # Keep significant
-    if (!is.null(assoc)) {
-      sig <- assoc[assoc$Score.pval < 1e-4, ]
-      if (nrow(sig) > 0) {
-        sig$Metabolite <- met
-        results_all[[met]] <- sig
-      }
-    }
-  }
-}
-
-# 9. Export significant results
-if (length(results_all) > 0) {
-  combined <- do.call(rbind, results_all)
-
-  final_results <- data.frame(
-    SNP = combined$variant.id,
-    Chr = combined$chr,
-    Position = combined$pos,
-    Metabolite = combined$Metabolite,
-    Effect_Allele = combined$allele.1,
-    Beta = combined$Est,
-    SE = combined$SE,
-    P_value = combined$Score.pval,
-    N = combined$n.obs,
-    stringsAsFactors = FALSE
-  )
-
-  write.xlsx(final_results, "significant_mQTLs.xlsx", row.names = FALSE)
-} else {
-  message("No significant SNP-metabolite associations found (p < 0.0001).")
-}
-
-# 10. Export heritabilities
-write.xlsx(heritabilities, "heritabilities.xlsx", row.names = FALSE)
-
-# 11. Cleanup
-snpgdsClose(gds)
-cat("✅ Task 2 completed successfully.\n")
+final_sig_assoc <- do.call(rbind,significant_assoc_results)
+final_assoc <- do.call(rbind, all_assoc_results)
+# Save each result to its own Excel file
+write.xlsx(final_assoc, file = "mQTLs.xlsx", rowNames = FALSE)
+write.xlsx(final_sig_assoc, file = "Significant_mQTLs.xlsx", rowNames = FALSE)
+write.xlsx(heritabilities, file = "Heritability.xlsx", rowNames = FALSE)
+write.xlsx(inflation_factors, file = "Inflation_Factors.xlsx", rowNames = FALSE)
 
 
 ```
-
 
 ```{r}
-# Load phenotype (metabolite) and covariate data
-pheno <- read.csv("qatari_metabolites_2025.csv")
-covars <- read.csv("covariates.csv")  # i dont have this or pc1 pr pc2 
-
-# Add first 3 PCs to covariates
-covars <- cbind(covars, pc1, pc2, pc3)
-
-# Create genotype object
-geno <- GdsGenotypeReader("Qatari156_filtered_pruned.gds")
-genoData <- GenotypeData(geno)
-
-# Fit null model (accounts for kinship and covariates)
-null_model <- fitNullModel(pheno, 
-                          outcome = "metabolite_level",
-                          covars = covars,
-                          cov.mat = kinship,
-                          family = gaussian())
-
-# Perform association testing
-assoc_results <- assocTestSingle(genoData, 
-                                null.model = null_model,
-                                test = "Score")
-
-# Save results
-write.csv(assoc_results, "mQTL_results.csv")
-
-```
-### 2d. Report significant associations (p < 0.0001)
-
-
-```{r}
-# Filter significant results
-sig_results <- assoc_results[assoc_results$p.value < 0.0001, ]
-
-# Select required columns
-report_table <- sig_results[, c("snpID", "chr", "pos", "beta", "SE", 
-                               "effect.allele", "n.obs", "p.value")]
-
-# Save to Excel
-write_xlsx(report_table, "significant_mQTLs.xlsx")
+library(openxlsx)
+write.xlsx(corrected_matrix, file = "corrected_metabloite.xlsx", rowNames = FALSE)
 ```
 
 
-### 2e. Report heritability
 
-```{r}
-# Calculate variance components
-var_comp <- varCompCI(null_model)
-
-# Extract heritability
-h2 <- var_comp$h2
-cat("Estimated heritability:", h2, "\n")
-
-```
 
 ## Task 3: Inflation Factor Calculation
 ```{r}
 # Calculate lambda (inflation factor) for each metabolite
-lambda_values <- sapply(unique(assoc_results$metabolite), function(metab) {
-    pvals <- assoc_results$p.value[assoc_results$metabolite == metab]
-    median(qchisq(pvals, df=1, lower.tail=FALSE)) / qchisq(0.5, 1)
+lambda_values <- sapply(names(all_assoc_results), function(metab) {
+    df <- all_assoc_results[[metab]]
+    pvals <- df$Score.pval
+    lambda <- median(qchisq(1 - pvals, df = 1)) / qchisq(0.5, 1)
+    return(lambda)
 })
-
 # Calculate average lambda
 avg_lambda <- mean(lambda_values)
 
-# Report results
-lambda_df <- data.frame(Metabolite = names(lambda_values), 
-                       Lambda = lambda_values)
-write.csv(lambda_df, "inflation_factors.csv")
 cat("Average inflation factor:", avg_lambda, "\n")
+
 ```
+
 
 ## Task 4: Manhattan Plot 
 ```{r}
-# Prepare data for Manhattan plot
-manhattan_data <- assoc_results %>%
-    select(chr, pos, p.value, metabolite) %>%
-    rename(CHR = chr, BP = pos, P = p.value, SNP = metabolite)
+# Read the map file
+snp_map <- read.table("Qatari156_filtered_pruned.map", header = FALSE, stringsAsFactors = FALSE)
 
-# Create Manhattan plot
-png("manhattan_plot.png", width=1000, height=600)
-manhattan(manhattan_data, 
-          main = "mQTL Manhattan Plot",
-          suggestiveline = -log10(1e-3), 
+# Assign proper column names
+colnames(snp_map) <- c("chr", "SNP", "cm", "pos")
+
+# Make sure chr and pos are the correct types
+snp_map$chr <- as.character(snp_map$chr)
+snp_map$pos <- as.numeric(snp_map$pos)
+
+for (metab in names(all_assoc_results)) {
+  all_assoc_results[[metab]] <- merge(all_assoc_results[[metab]], snp_map,
+                                  by = c("chr", "pos"),
+                                  all.x = TRUE)
+}
+
+library(qqman)
+
+# Combine all metabolite results into one data frame
+all_assoc <- do.call(rbind, all_assoc_results)
+
+# Rename for qqman
+colnames(all_assoc)[colnames(all_assoc) == "chr"] <- "CHR"
+colnames(all_assoc)[colnames(all_assoc) == "pos"] <- "BP"
+colnames(all_assoc)[colnames(all_assoc) == "Score.pval"] <- "P"
+
+# Ensure correct types
+all_assoc$CHR <- as.numeric(all_assoc$CHR)
+all_assoc$BP <- as.numeric(all_assoc$BP)
+
+# Filter only needed columns
+manhattan_df <- na.omit(all_assoc[, c("CHR", "BP", "SNP", "P")])
+
+manhattan(manhattan_df,
+          col = c("blue4", "orange3"),
           genomewideline = -log10(5e-8),
-          col = c("blue4", "orange3"))
-dev.off()
+          suggestiveline = -log10(1e-5),
+          main = "Manhattan Plot for All Metabolite Associations")
+
+
+
 ```
 
 ## Task 5: Metabolic Networks
 ###
 
 ```{r}
-# Correct metabolite levels
-corrected_metabs <- residuals(null_model)
 
-# Save corrected metabolites
-write.csv(corrected_metabs, "corrected_metabolites.csv")
+library(GeneNet)
+
+# Assume corrected_matrix includes scanID in first column; remove it for GeneNet input
+corrected_data <- corrected_matrix[, -1]  # Remove scanID column
+corrected_data <- as.matrix(corrected_data)  # Ensure matrix format
+
+# Step 1: Estimate the shrinkage partial correlation matrix
+pcor_matrix <- ggm.estimate.pcor(corrected_data)
+
+# Step 2: Test edges (returns a data frame of all possible edges)
+network_edges <- network.test.edges(pcor_matrix)
+
+
+network_edges$fdr <- p.adjust(network_edges$pval , method ="fdr")
+
+significant_edges <- subset(network_edges,fdr>0.85)
+
+# Step 4: Save the significant edges to a CSV file
+write.csv(significant_edges, "significant_metabolite3_edges.csv", row.names = FALSE)
+
+
+
 ```
-
-### 5b. Find significant metabolite pairs with GeneNet
 
 ```{r}
-# Compute partial correlations
-pcor <- ggm.estimate.pcor(corrected_metabs)
+knitr::include_graphics("task5.png")
 
-# Test for significance
-network <- network.test(pcor, corrected_metabs)
-
-# Extract significant pairs
-sig_pairs <- extract.network(network, cutoff.ggm = 0.95)
-
-# Save results
-write.csv(sig_pairs, "metabolite_network_pairs.csv")
 ```
-
-### 5c-d. Visualize network in Cytoscape
+## Task 6
 
 ```{r}
-# Prepare node attributes
-nodes <- data.frame(id = colnames(corrected_metabs),
-                    name = colnames(corrected_metabs))
+# Read the map file
+snp_map <- read.table("Qatari156_filtered_pruned.map", header = FALSE, stringsAsFactors = FALSE)
 
-# Prepare edge list
-edges <- sig_pairs %>%
-    select(node1, node2, edge.weights) %>%
-    rename(source = node1, target = node2, weight = edge.weights)
+# Assign proper column names
+colnames(snp_map) <- c("chr", "SNP", "cm", "pos")
 
-# Save for Cytoscape
-write.csv(nodes, "network_nodes.csv", row.names=FALSE)
-write.csv(edges, "network_edges.csv", row.names=FALSE)
+# Make sure chr and pos are the correct types
+snp_map$chr <- as.character(snp_map$chr)
+snp_map$pos <- as.numeric(snp_map$pos)
+
+for (metab in names(significant_assoc_results)) {
+  significant_assoc_results[[metab]] <- merge(significant_assoc_results[[metab]], snp_map,
+                                  by = c("chr", "pos"),
+                                  all.x = TRUE)
+}
+final_sig_task6 <- do.call(rbind,significant_assoc_results)
+write.xlsx(final_sig_task6, file = "Significant_mQTLs_snps.xlsx", rowNames = FALSE)
 ```
-
-## Task 6: Annotate Significant SNPs
 
 ```{r}
-# Get top 20 unique SNPs
-top_snps <- assoc_results %>%
-    arrange(p.value) %>%
-    distinct(snpID, .keep_all = TRUE) %>%
-    head(20)
 
-# Prepare ANNOVAR input
-annovar_input <- top_snps %>%
-    select(chr, pos, pos, ref, alt) %>%
-    mutate(chr = paste0("chr", chr))
 
-write.table(annovar_input, "annovar_input.txt", 
-            sep="\t", col.names=FALSE, row.names=FALSE, quote=FALSE)
+# Read the Excel file
+data <- read_xlsx("Significant_mQTLs_snps.xlsx")
+
+# Process the data to get top 20 by p-value (keeping all columns)
+top_20 <- data %>%
+  filter(!is.na(Score.pval), !is.na(SNP), !is.na(pos)) %>%
+  arrange(Score.pval) %>%  # Sort by p-value (ascending)
+  slice_head(n = 20) %>%
+  mutate(cm = round(cm, 6))  # Optionally round genetic distance 
+
+# View the result
+print(top_20)
+
+# Save to CSV
+write.csv(top_20, "top_20_significant_snps.csv", row.names = FALSE)
+
 
 ```
 
-### annotate_variation.pl annovar_input.txt humandb/ -buildver hg19 -out myanno -dbtype ensGene
-
-## Task 7: Regional Plots using SNIPA
 
 ```{r}
-# Get top 5 unique SNPs
-top5_snps <- assoc_results %>%
-    arrange(p.value) %>%
-    distinct(snpID, .keep_all = TRUE) %>%
-    head(5)
+library(dplyr)
+library(readr)
 
-# Prepare SNIPA input
-snipa_input <- top5_snps %>%
-    select(chr, pos, snpID)
+# Load and prepare top 20 SNPs file
+top20_df <- read_csv("top_20_significant_snps.csv", show_col_types = FALSE) %>%
+  mutate(
+    chr = gsub("^chr", "", as.character(chr)),  # Clean 'chr' prefix if present
+    pos = as.integer(pos)
+  )
 
-write.table(snipa_input, "snipa_input.txt", sep="\t", row.names=FALSE)
+# Load and prepare ANNOVAR annotation file
+annovar_df <- read_tsv("annotated_output_ali.hg19_multianno.txt", show_col_types = FALSE) %>%
+  mutate(
+    Chr = gsub("^chr", "", as.character(Chr)),  # Ensure consistency with top20_df
+    Start = as.integer(Start)
+  )
 
+# Select relevant annotation columns
+annovar_subset <- annovar_df %>%
+  select(Chr, Start, Gene = Gene.refGene, Function = Func.refGene)
+
+# Annotate top SNPs using a left join
+top20_annotated <- top20_df %>%
+  left_join(annovar_subset, by = c("chr" = "Chr", "pos" = "Start"))
+
+# Rearrange columns and remove temporary chr/pos
+top20_annotated <- top20_annotated %>%
+  select(SNP, everything(), -chr, -pos)
+
+# Save to CSV
+write_csv(top20_annotated, "top20_snps_with_gene_annotation_annovar.csv")
+
+# View in RStudio
+View(top20_annotated)
+
+
+
+```
+```{r}
+knitr::include_graphics("Screenshot 2025-05-20 022816.png")
+```
+
+## Task 7
+## for rs320017
+```{r}
+knitr::include_graphics("Screenshot 2025-05-19 164007.png")
+knitr::include_graphics("Screenshot 2025-05-20 000704.png")
+knitr::include_graphics("Screenshot 2025-05-20 020554.png")
 ```
 
 
+## for rs625127
+```{r}
+knitr::include_graphics("Screenshot 2025-05-19 164135.png")
+knitr::include_graphics("Screenshot 2025-05-20 001019.png")
+knitr::include_graphics("Screenshot 2025-05-20 020755.png")
+knitr::include_graphics("Screenshot 2025-05-20 001210.png")
+knitr::include_graphics("Screenshot 2025-05-20 020901.png")
+
+
+```
+
+## for rs17035560
+```{r}
+knitr::include_graphics("Screenshot 2025-05-19 164236.png")
+knitr::include_graphics("Screenshot 2025-05-20 001408.png")
+knitr::include_graphics("Screenshot 2025-05-20 021010.png")
+
+knitr::include_graphics("Screenshot 2025-05-20 001536.png")
+knitr::include_graphics("Screenshot 2025-05-20 021059.png")
 
 
 
 
+```
+
+## for rs17050199
+```{r}
+knitr::include_graphics("Screenshot 2025-05-19 164505.png")
+knitr::include_graphics("Screenshot 2025-05-20 001825.png")
+knitr::include_graphics("Screenshot 2025-05-20 021323.png")
+
+knitr::include_graphics("Screenshot 2025-05-20 001932.png")
+knitr::include_graphics("Screenshot 2025-05-20 021407.png")
+
+
+```
+
+## for rs1478782
+```{r}
+knitr::include_graphics("Screenshot 2025-05-19 164639.png")
+knitr::include_graphics("Screenshot 2025-05-20 002144.png")
+knitr::include_graphics("Screenshot 2025-05-20 021522.png")
+
+knitr::include_graphics("Screenshot 2025-05-20 002303.png")
+knitr::include_graphics("Screenshot 2025-05-20 021611.png")
+
+
+
+
+```
